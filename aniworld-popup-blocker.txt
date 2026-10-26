@@ -1,0 +1,98 @@
+// ==UserScript==
+// @name         Aniworld Popup Blocker
+// @namespace    local.aniworld.blocker
+// @version      2.0
+// @description  Blockiert Popunder-Tabs im Aniworld-Player (window.open) und Werbe-Tags
+// @match        *://*/*
+// @run-at       document-start
+// @all-frames   true
+// @grant        none
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const isTop = window === top;
+  const inAniworld =
+    /(^|\.)aniworld\.to$/.test(location.hostname) ||
+    (location.ancestorOrigins && [...location.ancestorOrigins].some(o => /aniworld\.to/.test(o)));
+  if (!inAniworld) return;
+
+  const log = (...a) => console.log('%c[Blocker]', 'color:#4caf50;font-weight:bold', ...a);
+  const isOwn = u => {
+    try { return /(^|\.)aniworld\.to$/.test(new URL(u, location.href).hostname); }
+    catch (e) { return false; }
+  };
+
+  // Im Player-iframe ist jedes neue Fenster Werbung, im Hauptfenster nur fremde Ziele
+  const shouldBlock = u => !isTop || !isOwn(u);
+
+  // Fake-Fenster, damit Werbescripts nicht merken, dass geblockt wurde
+  const makeFake = () => new Proxy(function () {}, {
+    get: (t, k) => (k === 'closed' ? false : k === 'location' ? { href: '' } : () => makeFake()),
+    set: () => true,
+    apply: () => makeFake()
+  });
+
+  // 1) window.open
+  const _open = window.open;
+  try {
+    Object.defineProperty(window, 'open', {
+      value: function (url) {
+        if (shouldBlock(url)) { log('window.open blockiert:', String(url)); return makeFake(); }
+        return _open.apply(this, arguments);
+      },
+      writable: false, configurable: false
+    });
+  } catch (e) { log('window.open konnte nicht ersetzt werden', e); }
+
+  // 2) Ausweichversuche über Links
+  const isAdLink = a => {
+    if (!a || !a.href) return false;
+    if (!/^https?:/.test(a.href)) return false;
+    return shouldBlock(a.href) && (a.target === '_blank' || !isTop);
+  };
+  const _aclick = HTMLAnchorElement.prototype.click;
+  HTMLAnchorElement.prototype.click = function () {
+    if (isAdLink(this)) { log('a.click() blockiert:', this.href); return; }
+    return _aclick.apply(this, arguments);
+  };
+  const _dispatch = EventTarget.prototype.dispatchEvent;
+  EventTarget.prototype.dispatchEvent = function (e) {
+    if (e && e.type === 'click' && !e.isTrusted && this instanceof HTMLAnchorElement && isAdLink(this)) {
+      log('dispatchEvent(click) blockiert:', this.href);
+      return false;
+    }
+    return _dispatch.apply(this, arguments);
+  };
+  const _submit = HTMLFormElement.prototype.submit;
+  HTMLFormElement.prototype.submit = function () {
+    if (this.target === '_blank' && shouldBlock(this.action)) { log('form.submit() blockiert:', this.action); return; }
+    return _submit.apply(this, arguments);
+  };
+
+  // 3) Echte Klicks auf Fremdlinks abfangen (nur Links, das Video bleibt bedienbar)
+  const stopAd = e => {
+    const a = e.target && e.target.closest && e.target.closest('a[href]');
+    if (a && isAdLink(a)) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      log('Link-Klick blockiert:', a.href);
+    }
+  };
+  ['click', 'auxclick'].forEach(t => document.addEventListener(t, stopAd, true));
+
+  // 4) Bekannte Werbe-Scripts nicht laden
+  const BAD = /(phruk\.org|al5sm\.com|nap5k\.com|spanish-speakingsecularisemethod\.com|connatix\.com|ads-twitter\.com)/;
+  const desc = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, 'src');
+  if (desc && desc.set) {
+    Object.defineProperty(HTMLScriptElement.prototype, 'src', {
+      get: desc.get,
+      set(v) {
+        if (BAD.test(String(v))) { log('Script blockiert:', v); return; }
+        desc.set.call(this, v);
+      },
+      configurable: true
+    });
+  }
+})();
